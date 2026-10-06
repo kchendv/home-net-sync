@@ -3,6 +3,8 @@ package com.example.homenetsync
 import android.app.DatePickerDialog
 import android.content.Context
 import android.content.Intent
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -70,8 +72,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enqueue() {
+        val localWifiRequest = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkRequest(localWifiRequest, NetworkType.CONNECTED)
+            .build()
         val request = OneTimeWorkRequestBuilder<SyncWorker>().setConstraints(
-            Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build()
+            constraints
         ).build()
         WorkManager.getInstance(this).enqueueUniqueWork("manual-sync", ExistingWorkPolicy.REPLACE, request)
     }
@@ -123,10 +132,6 @@ private fun SyncScreen(p: Prefs, sources: List<String>, onPick: () -> Unit, onUp
     val invalidDateRange = afterDate != null && beforeDate != null && afterDate!! > beforeDate!!
     fun connect(andThen: (() -> Unit)?) {
         if (checking) return
-        if (andThen != null && fieldsMatchSaved()) {
-            andThen()
-            return
-        }
         checking = true
         connectError = ""
         val form = DriveForm(host, share, user, password, domain, destination)
@@ -288,13 +293,23 @@ private fun DriveStatus(checking: Boolean, connected: Boolean, error: String, ho
 }
 
 private fun WorkInfo.toTransfer(): TransferUi {
-    if (state == WorkInfo.State.ENQUEUED) return TransferUi("Waiting for an unmetered Wi-Fi connection", null, "")
+    if (state == WorkInfo.State.ENQUEUED) {
+        return if (runAttemptCount > 0) {
+            TransferUi("Retrying sync after a connection error", null, "See the status below for the last error")
+        } else {
+            TransferUi("Waiting for Wi-Fi connection", null, "")
+        }
+    }
     val phase = progress.getString(SyncProgress.PHASE)
     val done = progress.getLong(SyncProgress.DONE, 0L)
     val total = progress.getLong(SyncProgress.TOTAL, 0L)
     val name = progress.getString(SyncProgress.NAME).orEmpty()
     return when (phase) {
-        SyncProgress.SCANNING -> TransferUi("Looking for files to copy", null, "")
+        SyncProgress.SCANNING -> TransferUi(
+            "Scanning phone folders",
+            null,
+            if (done > 0L) "$done files scanned" else ""
+        )
         SyncProgress.COPYING -> TransferUi(
             if (name.isBlank()) "Copying files" else "Copying $name",
             if (total > 0L) (done.toFloat() / total.toFloat()).coerceIn(0f, 1f) else null,

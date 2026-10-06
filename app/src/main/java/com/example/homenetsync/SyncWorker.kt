@@ -1,6 +1,7 @@
 package com.example.homenetsync
 
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
@@ -8,11 +9,14 @@ import android.net.Uri
 import android.os.SystemClock
 import androidx.documentfile.provider.DocumentFile
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.Calendar
@@ -37,52 +41,34 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         val prefs = Prefs(applicationContext)
         if (prefs.host.isBlank() || prefs.share.isBlank()) return fail(prefs, "Enter the SMB server and share name")
         if (prefs.sources.isEmpty()) return fail(prefs, "Choose at least one phone folder")
-        report(SyncProgress.CONNECTING, 0, 0, "", force = true)
+        setForeground(foregroundInfo(SyncProgress.CONNECTING, 0, 0, ""))
         val normalizedRoot = Smb.cleanPath(prefs.destination)
-        var copied = 0
-        var skipped = 0
+        val totals = Totals()
         try {
+            val beforeExclusive = prefs.beforeDate?.let { date ->
+                Calendar.getInstance().apply {
+                    timeInMillis = date
+                    add(Calendar.DAY_OF_MONTH, 1)
+                }.timeInMillis
+            }
+            val roots = prefs.sources.mapNotNull { treeUri ->
+                DocumentFile.fromTreeUri(applicationContext, Uri.parse(treeUri))
+            }
+            report(SyncProgress.SCANNING, 0, 0, "", force = true)
+            for (source in roots) measure(source, prefs.afterDate, beforeExclusive, totals)
+            report(SyncProgress.SCANNING, totals.scanned, 0, "", force = true)
+
+            report(SyncProgress.CONNECTING, 0, 0, "", force = true)
             Smb.useShare(prefs.host, prefs.share, prefs.user, prefs.password, prefs.domain, timeoutSeconds = 120) { remote ->
                 Smb.ensureDirectories(remote, normalizedRoot)
-                report(SyncProgress.SCANNING, 0, 0, "", force = true)
-                val pending = mutableListOf<Pending>()
-                val beforeExclusive = prefs.beforeDate?.let { date ->
-                    Calendar.getInstance().apply {
-                        timeInMillis = date
-                        add(Calendar.DAY_OF_MONTH, 1)
-                    }.timeInMillis
-                }
-                for (treeUri in prefs.sources) {
-                    val source = DocumentFile.fromTreeUri(applicationContext, Uri.parse(treeUri)) ?: continue
-                    collect(source, source.name ?: "Phone", "", remote, normalizedRoot, prefs.afterDate, beforeExclusive, pending) { skipped++ }
-                }
-                val useBytes = pending.any { it.size > 0L }
-                val total = if (useBytes) pending.sumOf { it.size } else pending.size.toLong()
-                var done = 0L
-                report(SyncProgress.COPYING, 0, total, "", force = true)
-                for (item in pending) {
-                    report(SyncProgress.COPYING, done, total, item.name, force = true)
-                    val input = applicationContext.contentResolver.openInputStream(item.uri)
-                    if (input == null) {
-                        skipped++
-                        done = advance(done, item.size, 0, useBytes)
-                        continue
-                    }
-                    var written = 0L
-                    input.use { stream ->
-                        remote.openOutput(item.remote).use { output ->
-                            written = copy(stream, output) { soFar ->
-                                val shown = if (useBytes) done + soFar else done
-                                report(SyncProgress.COPYING, shown, total, item.name)
-                            }
-                        }
-                    }
-                    copied++
-                    done = advance(done, item.size, written, useBytes)
-                    report(SyncProgress.COPYING, done, total, item.name, force = true)
+                report(SyncProgress.COPYING, 0, totals.progressTotal, "", force = true)
+                for (source in roots) {
+                    copyTree(source, source.name ?: "Phone", "", remote, normalizedRoot,
+                        prefs.afterDate, beforeExclusive, totals)
                 }
             }
-            prefs.status = "Finished: $copied copied, $skipped skipped"
+            report(SyncProgress.COPYING, totals.progressTotal, totals.progressTotal, "", force = true)
+            prefs.status = "Finished: ${totals.copied} copied, ${totals.skipped} skipped"
             NotificationManagerCompat.from(applicationContext).cancel(SyncProgress.NOTIFICATION_ID)
             return Result.success()
         } catch (e: CancellationException) {
@@ -94,7 +80,27 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         }
     }
 
-    private fun collect(
+    private suspend fun measure(
+        node: DocumentFile,
+        afterDate: Long?,
+        beforeExclusive: Long?,
+        totals: Totals
+    ) {
+        currentCoroutineContext().ensureActive()
+        if (node.isDirectory) {
+            for (child in node.listFiles()) measure(child, afterDate, beforeExclusive, totals)
+        } else if (node.isFile) {
+            val modified = node.lastModified()
+            totals.scanned++
+            report(SyncProgress.SCANNING, totals.scanned, 0, "")
+            if (isInRange(modified, afterDate, beforeExclusive)) {
+                totals.eligibleFiles++
+                totals.totalBytes += node.length().coerceAtLeast(0L)
+            }
+        }
+    }
+
+    private suspend fun copyTree(
         node: DocumentFile,
         sourceName: String,
         relative: String,
@@ -102,35 +108,57 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         destination: String,
         afterDate: Long?,
         beforeExclusive: Long?,
-        pending: MutableList<Pending>,
-        onSkip: () -> Unit
+        totals: Totals
     ) {
+        currentCoroutineContext().ensureActive()
         if (node.isDirectory) {
             val dirRelative = listOf(sourceName, relative).filter { it.isNotBlank() }.joinToString("/")
-            val dir = Smb.join(destination, dirRelative)
-            Smb.ensureDirectories(remote, dir)
-            node.listFiles().forEach { child ->
+            Smb.ensureDirectories(remote, Smb.join(destination, dirRelative))
+            for (child in node.listFiles()) {
                 val childRelative = listOf(relative, child.name ?: "unnamed").filter { it.isNotBlank() }.joinToString("/")
-                collect(child, sourceName, childRelative, remote, destination, afterDate, beforeExclusive, pending, onSkip)
+                copyTree(child, sourceName, childRelative, remote, destination, afterDate, beforeExclusive, totals)
             }
         } else if (node.isFile) {
-            val modified = node.lastModified()
-            if ((afterDate != null && modified < afterDate) || (beforeExclusive != null && modified >= beforeExclusive)) {
-                onSkip()
+            val size = node.length().coerceAtLeast(0L)
+            if (!isInRange(node.lastModified(), afterDate, beforeExclusive)) {
+                totals.skipped++
                 return
             }
+            val name = node.name ?: "file"
             val remotePath = Smb.join(destination, listOf(sourceName, relative).filter { it.isNotBlank() }.joinToString("/"))
-            val parent = remotePath.substringBeforeLast('/', "")
-            Smb.ensureDirectories(remote, parent)
-            // Skip existing files. This keeps repeated scheduled runs idempotent and avoids
-            // replacing a newer copy already on the drive.
+            val useBytes = totals.totalBytes > 0L
+            val planned = if (useBytes) size else 1L
+            // Keep repeated syncs idempotent and avoid replacing an existing remote file.
             if (remote.fileExists(remotePath)) {
-                onSkip()
+                totals.skipped++
+                totals.done += planned
+                report(SyncProgress.COPYING, totals.done, totals.progressTotal, name, force = true)
                 return
             }
-            pending += Pending(node.uri, remotePath, node.name ?: "file", node.length().coerceAtLeast(0L))
+            val input = applicationContext.contentResolver.openInputStream(node.uri)
+            if (input == null) {
+                totals.skipped++
+                totals.done += planned
+                report(SyncProgress.COPYING, totals.done, totals.progressTotal, name, force = true)
+                return
+            }
+            var written = 0L
+            input.use { stream ->
+                remote.openOutput(remotePath).use { output ->
+                    written = copy(stream, output) { soFar ->
+                        report(SyncProgress.COPYING, totals.done + (if (useBytes) soFar else 0L),
+                            totals.progressTotal, name)
+                    }
+                }
+            }
+            totals.copied++
+            totals.done += if (useBytes) size.coerceAtLeast(written) else 1L
+            report(SyncProgress.COPYING, totals.done, totals.progressTotal, name, force = true)
         }
     }
+
+    private fun isInRange(modified: Long, afterDate: Long?, beforeExclusive: Long?) =
+        (afterDate == null || modified >= afterDate) && (beforeExclusive == null || modified < beforeExclusive)
 
     private suspend fun copy(input: InputStream, output: OutputStream, onProgress: suspend (Long) -> Unit): Long {
         val buffer = ByteArray(64 * 1024)
@@ -143,11 +171,6 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             onProgress(written)
         }
         return written
-    }
-
-    private fun advance(done: Long, planned: Long, written: Long, useBytes: Boolean): Long {
-        if (!useBytes) return done + 1
-        return done + planned.coerceAtLeast(written)
     }
 
     private suspend fun report(phase: String, done: Long, total: Long, name: String, force: Boolean = false) {
@@ -175,11 +198,24 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     }
 
     private fun postNotification(phase: String, done: Long, total: Long, name: String) {
+        runCatching { NotificationManagerCompat.from(applicationContext).notify(SyncProgress.NOTIFICATION_ID, buildNotification(phase, done, total, name)) }
+    }
+
+    private fun foregroundInfo(phase: String, done: Long, total: Long, name: String): ForegroundInfo {
+        val notification = buildNotification(phase, done, total, name)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(SyncProgress.NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            ForegroundInfo(SyncProgress.NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun buildNotification(phase: String, done: Long, total: Long, name: String) = run {
         val title: String
         val text: String
         val progress: Int
         val indeterminate: Boolean
-        when (phase) {
+            when (phase) {
             SyncProgress.CONNECTING -> {
                 title = "Connecting to home drive"
                 text = "Preparing the sync"
@@ -188,7 +224,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             }
             SyncProgress.SCANNING -> {
                 title = "Scanning phone folders"
-                text = "Looking for files to copy"
+                text = if (done > 0L) "$done files scanned" else "Looking for files to copy"
                 progress = 0
                 indeterminate = true
             }
@@ -199,7 +235,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                 indeterminate = total <= 0L
             }
         }
-        val notification = NotificationCompat.Builder(applicationContext, SyncProgress.NOTIFICATION_CHANNEL)
+        NotificationCompat.Builder(applicationContext, SyncProgress.NOTIFICATION_CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentTitle(title)
             .setContentText(text)
@@ -207,13 +243,20 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             .setOngoing(true)
             .setProgress(100, progress, indeterminate)
             .build()
-        runCatching { NotificationManagerCompat.from(applicationContext).notify(SyncProgress.NOTIFICATION_ID, notification) }
     }
 
     private fun fail(prefs: Prefs, message: String): Result {
         prefs.status = message
-        return Result.retry()
+        return Result.failure()
     }
 
-    private class Pending(val uri: Uri, val remote: String, val name: String, val size: Long)
+    private class Totals {
+        var scanned = 0L
+        var eligibleFiles = 0L
+        var totalBytes = 0L
+        var done = 0L
+        var copied = 0
+        var skipped = 0
+        val progressTotal: Long get() = if (totalBytes > 0L) totalBytes else eligibleFiles
+    }
 }

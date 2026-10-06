@@ -10,7 +10,7 @@ Home Net Sync is a native Android app that copies eligible files from folders on
 - Start a manual sync and follow progress in the app or its notification. Cancel a queued or active sync from the app.
 - Preserve each selected folder's name and internal directory structure at the destination. Existing remote files are skipped.
 
-Sync work requires an unmetered network connection and may be deferred by Android. The SMB drive must be reachable from the connected network. On Android 13 and newer, allow notifications to see sync progress in the notification shade. Sync itself can run if notifications are denied, but its notification will not be shown.
+Sync work waits for Wi-Fi, including Wi-Fi without internet access, and may be deferred by Android. Large syncs run as a foreground operation with a persistent progress notification. The SMB drive must be reachable from that Wi-Fi network. On Android 13 and newer, allow notifications to see sync progress in the notification shade. Sync itself can run if notifications are denied, but its notification will not be shown.
 
 ## Requirements
 
