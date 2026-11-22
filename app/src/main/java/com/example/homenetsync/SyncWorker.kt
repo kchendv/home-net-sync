@@ -76,7 +76,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             throw e
         } catch (e: Exception) {
             NotificationManagerCompat.from(applicationContext).cancel(SyncProgress.NOTIFICATION_ID)
-            return fail(prefs, "Sync failed: ${e.message ?: e.javaClass.simpleName}")
+            return fail(prefs, "Sync failed: ${Smb.describeError(e)}")
         }
     }
 

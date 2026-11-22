@@ -3,6 +3,7 @@ package com.example.homenetsync
 import android.app.DatePickerDialog
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
@@ -10,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.Manifest
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -37,6 +39,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var prefs: Prefs
     private var update: (() -> Unit)? = null
     private var afterNotificationPermission: (() -> Unit)? = null
+    private var localNetworkPermissionPending = false
+    private var afterLocalNetworkGranted: (() -> Unit)? = null
+    private var afterLocalNetworkDenied: (() -> Unit)? = null
+    private val localNetworkPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        localNetworkPermissionPending = false
+        val action = if (granted) afterLocalNetworkGranted else afterLocalNetworkDenied
+        afterLocalNetworkGranted = null
+        afterLocalNetworkDenied = null
+        action?.invoke()
+    }
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         afterNotificationPermission?.invoke()
         afterNotificationPermission = null
@@ -64,7 +76,10 @@ class MainActivity : ComponentActivity() {
                         onPick = { folderPicker.launch(null) },
                         onUpdate = { redraw++ },
                         onSync = { withNotifications { enqueue() } },
-                        onCancel = { WorkManager.getInstance(this).cancelUniqueWork("manual-sync") }
+                        onCancel = { WorkManager.getInstance(this).cancelUniqueWork("manual-sync") },
+                        onLocalNetworkAccess = { onGranted, onDenied ->
+                            withLocalNetworkAccess(onGranted, onDenied)
+                        }
                     )
                 }
             }
@@ -93,10 +108,31 @@ class MainActivity : ComponentActivity() {
             action()
         }
     }
+
+    private fun withLocalNetworkAccess(onGranted: () -> Unit, onDenied: () -> Unit) {
+        val permission = "android.permission.ACCESS_LOCAL_NETWORK"
+        if (Build.VERSION.SDK_INT < 37 || ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
+            onGranted()
+            return
+        }
+        if (localNetworkPermissionPending) return
+        localNetworkPermissionPending = true
+        afterLocalNetworkGranted = onGranted
+        afterLocalNetworkDenied = onDenied
+        localNetworkPermission.launch(permission)
+    }
 }
 
 @Composable
-private fun SyncScreen(p: Prefs, sources: List<String>, onPick: () -> Unit, onUpdate: () -> Unit, onSync: () -> Unit, onCancel: () -> Unit) {
+private fun SyncScreen(
+    p: Prefs,
+    sources: List<String>,
+    onPick: () -> Unit,
+    onUpdate: () -> Unit,
+    onSync: () -> Unit,
+    onCancel: () -> Unit,
+    onLocalNetworkAccess: (onGranted: () -> Unit, onDenied: () -> Unit) -> Unit
+) {
     var host by remember { mutableStateOf(p.host) }
     var share by remember { mutableStateOf(p.share) }
     var user by remember { mutableStateOf(p.user) }
@@ -132,39 +168,43 @@ private fun SyncScreen(p: Prefs, sources: List<String>, onPick: () -> Unit, onUp
     val invalidDateRange = afterDate != null && beforeDate != null && afterDate!! > beforeDate!!
     fun connect(andThen: (() -> Unit)?) {
         if (checking) return
-        checking = true
-        connectError = ""
-        val form = DriveForm(host, share, user, password, domain, destination)
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { Smb.test(form.host, form.share, form.user, form.password, form.domain, form.destination) }
-            }
-            checking = false
-            result.onSuccess {
-                if (p.saveDrive(form.host, form.share, form.user, form.password, form.domain, form.destination)) {
-                    host = p.host
-                    share = p.share
-                    user = p.user
-                    password = p.password
-                    domain = p.domain
-                    destination = p.destination
-                    driveSaved = true
-                    connectError = ""
-                    andThen?.invoke()
-                } else {
-                    driveSaved = false
-                    connectError = "Could not save the drive configuration"
+        onLocalNetworkAccess({
+            checking = true
+            connectError = ""
+            val form = DriveForm(host, share, user, password, domain, destination)
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching { Smb.test(form.host, form.share, form.user, form.password, form.domain, form.destination) }
                 }
-            }.onFailure { error ->
-                val failedSaved = driveSaved && form.host.trim() == p.host && form.share.trim() == p.share &&
-                    form.user == p.user && form.password == p.password && form.domain == p.domain && form.destination == p.destination
-                if (failedSaved) {
-                    p.markDriveDisconnected()
-                    driveSaved = false
+                checking = false
+                result.onSuccess {
+                    if (p.saveDrive(form.host, form.share, form.user, form.password, form.domain, form.destination)) {
+                        host = p.host
+                        share = p.share
+                        user = p.user
+                        password = p.password
+                        domain = p.domain
+                        destination = p.destination
+                        driveSaved = true
+                        connectError = ""
+                        andThen?.invoke()
+                    } else {
+                        driveSaved = false
+                        connectError = "Could not save the drive configuration"
+                    }
+                }.onFailure { error ->
+                    val failedSaved = driveSaved && form.host.trim() == p.host && form.share.trim() == p.share &&
+                        form.user == p.user && form.password == p.password && form.domain == p.domain && form.destination == p.destination
+                    if (failedSaved) {
+                        p.markDriveDisconnected()
+                        driveSaved = false
+                    }
+                    connectError = "Could not connect: ${Smb.describeError(error)}"
                 }
-                connectError = "Could not connect: ${error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName}"
             }
-        }
+        }, {
+            connectError = "Allow local network access so Home Net Sync can reach the SMB drive."
+        })
     }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(14.dp), contentPadding = PaddingValues(top = 24.dp, bottom = 32.dp)) {
         item {

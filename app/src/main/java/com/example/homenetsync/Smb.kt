@@ -11,6 +11,12 @@ import java.net.URLEncoder
 import java.util.Properties
 
 internal object Smb {
+    fun describeError(error: Throwable): String {
+        var cause = error
+        while (cause.cause != null && cause.cause !== cause) cause = cause.cause!!
+        return cause.message?.takeIf { it.isNotBlank() } ?: cause.javaClass.simpleName
+    }
+
     suspend fun test(host: String, share: String, user: String, password: String, domain: String, destination: String) {
         if (host.isBlank() || share.isBlank()) {
             throw IllegalArgumentException("Enter the server address and share name")
